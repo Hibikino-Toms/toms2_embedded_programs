@@ -1,8 +1,8 @@
 // @author Renshi Kato
 // -----------------------------------------
-// crawler_motor.ino
-// 左右のモータを目標距離まで移動させるための制御プログラム
-// エンコーダでカウントした値を基にモータの動作を管理し、ROS2ノードと通信を行う
+// crawler_motor_twist_control.ino
+// ROS2ノードから左右のPWM値を受信し、モータをリアルタイムに制御するプログラム
+// エンコーダカウント値はROS2ノード(接続しているPC)にシリアルで送信する
 
 // エンコーダ用ピン
 const int A_pin_left = 6;   // 左エンコーダ B相
@@ -17,27 +17,23 @@ const int right_dir_pin = 20;  // 右モータ DIRピン
 const int right_pwm_pin = 21;  // 右モータ PWMピン
 
 // エンコーダカウント変数
-volatile int encoder_count_left = 0;   // 左エンコーダのカウント
-volatile int encoder_count_right = 0;  // 右エンコーダのカウント
-int target_pulses_left = 0;            // 左エンコーダ目標パルス
-int target_pulses_right = 0;           // 右エンコーダ目標パルス
+volatile long encoder_count_left = 0;   // 左エンコーダのカウント
+volatile long encoder_count_right = 0;  // 右エンコーダのカウント
 
-// パルス変換関連
-// const float pulses_per_mm = 10000.0 / 610.0; // 610mmで10000パルス
+// 受信したPWM値を格納する変数
+int received_pwm_left = 0;
+int received_pwm_right = 0;
 
-// モータ制御関連
-int control_delay = 10;  // 制御ループの遅延（ms）
+// シリアル通信のタイムアウト管理
+unsigned long last_command_time = 0;
+const unsigned long command_timeout_ms = 500; // 0.5秒コマンドが来なければ停止
 
 void setup() {
-  // 初期設定関数
-  // エンコーダピン、モータ制御ピン、シリアル通信を初期化する
-
-  // 左エンコーダのピン設定
+  // エンコーダピン設定
   pinMode(A_pin_left, INPUT_PULLUP);
   pinMode(B_pin_left, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(A_pin_left), encoderISRLeft, CHANGE);
 
-  // 右エンコーダのピン設定
   pinMode(A_pin_right, INPUT_PULLUP);
   pinMode(B_pin_right, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(A_pin_right), encoderISRRight, CHANGE);
@@ -49,88 +45,109 @@ void setup() {
   pinMode(right_pwm_pin, OUTPUT);
 
   // シリアル通信の初期化
-  Serial.begin(9600);
+  Serial.begin(115200); // ROS2ノード側のボーレートと一致させる
+  
+  // 初期状態でモーターを停止
+  controlMotors(0, 0);
+  last_command_time = millis(); // 現在時刻を記録
 }
 
 void loop() {
-  // メインループ関数
-  // 1. シリアル通信でROS2ノードから移動パルス量とPWM値を受信
-  // 2. モータを制御して目標距離まで移動
-  // 3. エンコーダカウント値をROS2ノードへ送信
-
-  // ROS2ノードからPWM値と移動パルス量を受信
+  // 1. シリアル通信でROS2ノードから左右のPWM値を受信
   if (Serial.available()) {
     String input = Serial.readStringUntil('\n');
     int comma_index = input.indexOf(',');
+    
     if (comma_index != -1) {
-      int received_pulses = input.substring(0, comma_index).toInt();
-      int pwm_value = input.substring(comma_index + 1).toInt();
-
-      target_pulses_left = received_pulses;
-      target_pulses_right = received_pulses;
-
-      controlMotorsToTarget(pwm_value);
+      received_pwm_left = input.substring(0, comma_index).toInt();
+      received_pwm_right = input.substring(comma_index + 1).toInt();
+      
+      // 受信したPWM値を直接モーターに適用
+      controlMotors(received_pwm_left, received_pwm_right);
+      last_command_time = millis(); // コマンド受信時刻を更新
     }
   }
 
-  // パルスカウント値をROS2ノードに送信
-  String encoder_data = String(encoder_count_left) + "," + String(encoder_count_right);
-  Serial.println(encoder_data);
-  delay(50);  // データ送信間隔
+  // コマンドタイムアウト処理
+  if (millis() - last_command_time > command_timeout_ms) {
+    controlMotors(0, 0); // コマンドが途絶えたらモーターを停止
+    // Serial.println("Timeout! Motors stopped."); // デバッグ用
+  }
+
+  // 2. エンコーダカウント値をROS2ノードに送信
+  // この送信間隔はROS2ノードのオドメトリ更新レートなどに影響します。
+  // 必要に応じて調整してください。
+  static unsigned long last_encoder_send_time = 0;
+  const unsigned long encoder_send_interval_ms = 50; // 50msごとに送信
+
+  if (millis() - last_encoder_send_time >= encoder_send_interval_ms) {
+    String encoder_data = String(encoder_count_left) + "," + String(encoder_count_right);
+    Serial.println(encoder_data);
+    last_encoder_send_time = millis();
+  }
+  
+  // 短い遅延を挟むことで、CPU負荷を軽減し、安定性を向上させる
+  delay(1); 
 }
 
 void encoderISRLeft() {
   // 左エンコーダの割り込み処理
-  // エンコーダの信号を基にカウント値を増減させる
-
-  if (digitalRead(A_pin_left) ^ digitalRead(B_pin_left)) {
-    encoder_count_left++;
-  } else {
-    encoder_count_left--;
+  if (digitalRead(A_pin_left) == HIGH) { // A相がHIGHの時
+    if (digitalRead(B_pin_left) == LOW) { // B相がLOWなら正転
+      encoder_count_left++;
+    } else { // B相がHIGHなら逆転
+      encoder_count_left--;
+    }
+  } else { // A相がLOWの時
+    if (digitalRead(B_pin_left) == HIGH) { // B相がHIGHなら正転
+      encoder_count_left++;
+    } else { // B相がLOWなら逆転
+      encoder_count_left--;
+    }
   }
 }
 
 void encoderISRRight() {
   // 右エンコーダの割り込み処理
-  // エンコーダの信号を基にカウント値を増減させる
-
-  if (digitalRead(A_pin_right) ^ digitalRead(B_pin_right)) {
-    encoder_count_right++;
-  } else {
-    encoder_count_right--;
+  if (digitalRead(A_pin_right) == HIGH) { // A相がHIGHの時
+    if (digitalRead(B_pin_right) == HIGH) { // B相がHIGHなら正転 (注意: 回転方向の定義による)
+      encoder_count_right--;
+    } else { // B相がLOWなら逆転
+      encoder_count_right++;
+    }
+  } else { // A相がLOWの時
+    if (digitalRead(B_pin_right) == LOW) { // B相がLOWなら正転
+      encoder_count_right--;
+    } else { // B相がHIGHなら逆転
+      encoder_count_right++;
+    }
   }
 }
 
-void controlMotorsToTarget(int pwm_value) {
-  // 両輪のモータを目標パルス数まで制御する関数
-  // 各エンコーダのカウント値を監視しながら、目標距離までモータを動かす
 
-  int initial_count_left = encoder_count_left;    // 左エンコーダの初期値を保存
-  int initial_count_right = encoder_count_right;  // 右エンコーダの初期値を保存
-  bool left_motor_active = true;
-  bool right_motor_active = true;
+void controlMotors(int pwm_left, int pwm_right) {
+  // 左右のモータを直接PWM値で制御する関数
+  // pwm_left, pwm_right の範囲は -100 から 100 を想定 (ROS2ノード側でクリップ済み)
 
-  while (left_motor_active || right_motor_active) {
-    // 左モータの制御
-    int relative_count_left = encoder_count_left - initial_count_left;  // 相対カウント
-    if (left_motor_active && abs(relative_count_left) < abs(target_pulses_left)) {
-      digitalWrite(left_dir_pin, target_pulses_left > 0 ? LOW : HIGH);
-      analogWrite(left_pwm_pin, pwm_value);
-    } else {
-      analogWrite(left_pwm_pin, 0);
-      left_motor_active = false;  // 左モータ停止
-    }
+  // 左モータの制御
+  if (pwm_left > 0) { // 前進
+    digitalWrite(left_dir_pin, LOW); // モータドライバに合わせてHIGH/LOWを調整
+    analogWrite(left_pwm_pin, map(pwm_left, 0, 100, 0, 255)); // 0-100を0-255にマッピング
+  } else if (pwm_left < 0) { // 後退
+    digitalWrite(left_dir_pin, HIGH); // モータドライバに合わせてHIGH/LOWを調整
+    analogWrite(left_pwm_pin, map(abs(pwm_left), 0, 100, 0, 255));
+  } else { // 停止
+    analogWrite(left_pwm_pin, 0);
+  }
 
-    // 右モータの制御
-    int relative_count_right = encoder_count_right - initial_count_right;  // 相対カウント
-    if (right_motor_active && abs(relative_count_right) < abs(target_pulses_right)) {
-      digitalWrite(right_dir_pin, target_pulses_right > 0 ? HIGH : LOW);
-      analogWrite(right_pwm_pin, pwm_value);
-    } else {
-      analogWrite(right_pwm_pin, 0);
-      right_motor_active = false;  // 右モータ停止
-    }
-
-    delay(control_delay);
+  // 右モータの制御
+  if (pwm_right > 0) { // 前進
+    digitalWrite(right_dir_pin, HIGH); // モータドライバに合わせてHIGH/LOWを調整 (左右でHIGH/LOWが逆の場合が多い)
+    analogWrite(right_pwm_pin, map(pwm_right, 0, 100, 0, 255));
+  } else if (pwm_right < 0) { // 後退
+    digitalWrite(right_dir_pin, LOW); // モータドライバに合わせてHIGH/LOWを調整
+    analogWrite(right_pwm_pin, map(abs(pwm_right), 0, 100, 0, 255));
+  } else { // 停止
+    analogWrite(right_pwm_pin, 0);
   }
 }
